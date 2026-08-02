@@ -1,10 +1,10 @@
 from decimal import Decimal
 
-from boto3.dynamodb.conditions import Attr
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException
 
-from database import decimals_to_number, get_db_table, scan_all_items
+from database import products_table, variants_table
 from models import StockItem
 from security import get_current_user
 
@@ -15,50 +15,54 @@ router = APIRouter(
 )
 
 
-def find_variant(doc: dict | None, sku: str) -> dict | None:
-    if doc is None:
-        return None
-    return next((v for v in doc["variants"] if v["sku"] == sku), None)
+def _decimal_to_native(obj):
+    """Recursively convert Decimal values to int/float for JSON serialisation."""
+    if isinstance(obj, list):
+        return [_decimal_to_native(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _decimal_to_native(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal):
+        f = float(obj)
+        return int(f) if f == int(f) else f
+    return obj
+
+
+def _get_variant(sku: str) -> tuple[dict | None, dict | None]:
+    """Return (variant_item, product_item) or (None, None) if not found."""
+    result = variants_table.get_item(Key={"sku": sku})
+    variant = result.get("Item")
+    if variant is None:
+        return None, None
+    product_result = products_table.get_item(Key={"product_id": variant["product_id"]})
+    product = product_result.get("Item")
+    if product is None or not product.get("is_active", False):
+        return None, None
+    return variant, product
 
 
 @router.get("/variants/{sku}")
-async def get_variant(sku: str, table=Depends(get_db_table)):
-    items = await scan_all_items(table, Attr("is_active").eq(True))
-    doc = None
-    variant = None
-    for item in items:
-        variant = find_variant(item, sku)
-        if variant is not None:
-            doc = item
-            break
+async def get_variant(sku: str):
+    variant, product = _get_variant(sku)
     if variant is None:
         raise HTTPException(status_code=404, detail="SKU not found")
-
-    doc = decimals_to_number(doc)
-    variant = decimals_to_number(variant)
-    return {
-        "product_id": doc["item_id"],
-        "name": doc["name"],
-        "image_url": doc.get("image_url", ""),
+    return _decimal_to_native({
+        "product_id": variant["product_id"],
+        "name": product["name"],
+        "image_url": product.get("image_url", ""),
         "sku": variant["sku"],
         "color": variant["color"],
         "size": variant["size"],
         "price": variant["price"],
         "stock_quantity": variant["stock_quantity"],
-    }
+    })
 
 
 @router.post("/stock/check")
-async def check_stock(items: list[StockItem], table=Depends(get_db_table)):
+async def check_stock(items: list[StockItem]):
     results = []
     for item in items:
-        docs = await scan_all_items(table, Attr("is_active").eq(True))
-        variant = None
-        for doc in docs:
-            variant = find_variant(doc, item.sku)
-            if variant is not None:
-                break
-        available = decimals_to_number(variant["stock_quantity"]) if variant else 0
+        variant, product = _get_variant(item.sku)
+        available = int(variant["stock_quantity"]) if variant else 0
         results.append(
             {
                 "sku": item.sku,
@@ -70,43 +74,21 @@ async def check_stock(items: list[StockItem], table=Depends(get_db_table)):
 
 
 @router.post("/stock/decrement")
-async def decrement_stock(items: list[StockItem], table=Depends(get_db_table)):
-    # No rollback of earlier items on partial failure — an accepted MVP gap
-    # (see README: reservations/sagas are the Phase 2 exercise).
+async def decrement_stock(items: list[StockItem]):
     failed = []
     for item in items:
-        docs = await scan_all_items(table)
-        target_item_id = None
-        target_index = None
-        for doc in docs:
-            for index, variant in enumerate(doc.get("variants", [])):
-                if variant["sku"] == item.sku:
-                    target_item_id = doc["item_id"]
-                    target_index = index
-                    break
-            if target_item_id is not None:
-                break
-
-        if target_item_id is None:
-            failed.append(item.sku)
-            continue
-
         try:
-            await table.update_item(
-                Key={"item_id": target_item_id},
-                UpdateExpression=(
-                    f"SET variants[{target_index}].stock_quantity = "
-                    f"variants[{target_index}].stock_quantity - :qty"
-                ),
-                ConditionExpression=f"variants[{target_index}].stock_quantity >= :qty",
-                ExpressionAttributeValues={":qty": Decimal(str(item.quantity))},
+            variants_table.update_item(
+                Key={"sku": item.sku},
+                UpdateExpression="ADD stock_quantity :neg",
+                ConditionExpression=Attr("stock_quantity").gte(item.quantity),
+                ExpressionAttributeValues={":neg": -item.quantity},
             )
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 failed.append(item.sku)
             else:
                 raise
-
     if failed:
         raise HTTPException(
             status_code=409,
