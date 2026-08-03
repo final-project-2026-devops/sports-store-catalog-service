@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from boto3.dynamodb.conditions import Attr, Key
+from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -61,7 +61,7 @@ async def get_variant(sku: str):
 async def check_stock(items: list[StockItem]):
     results = []
     for item in items:
-        variant, product = _get_variant(item.sku)
+        variant, _product = _get_variant(item.sku)
         available = int(variant["stock_quantity"]) if variant else 0
         results.append(
             {

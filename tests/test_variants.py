@@ -1,26 +1,35 @@
-from unittest.mock import AsyncMock, patch
+from decimal import Decimal
+from unittest.mock import patch
 
-PRODUCT_DOC = {
-    "_id": "507f1f77bcf86cd799439021",
+PRODUCT = {
+    "product_id": "p1",
     "name": "Velocity Runner",
     "image_url": "/img/velocity.png",
-    "variants": [
-        {"sku": "VR-BLK-42", "color": "Black", "size": "42",
-         "price": 129.99, "stock_quantity": 15},
-    ],
+    "is_active": True,
+}
+
+VARIANT = {
+    "sku": "VR-BLK-42",
+    "product_id": "p1",
+    "color": "Black",
+    "size": "42",
+    "price": Decimal("129.99"),
+    "stock_quantity": 15,
 }
 
 
 def test_get_variant_snapshot(client, auth_headers):
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.find_one = AsyncMock(return_value=PRODUCT_DOC.copy())
+    with patch("routes.internal.variants_table") as mock_variants, \
+         patch("routes.internal.products_table") as mock_products:
+        mock_variants.get_item.return_value = {"Item": VARIANT.copy()}
+        mock_products.get_item.return_value = {"Item": PRODUCT.copy()}
         response = client.get(
             "/api/internal/variants/VR-BLK-42", headers=auth_headers
         )
 
     assert response.status_code == 200
     assert response.json() == {
-        "product_id": "507f1f77bcf86cd799439021",
+        "product_id": "p1",
         "name": "Velocity Runner",
         "image_url": "/img/velocity.png",
         "sku": "VR-BLK-42",
@@ -32,8 +41,8 @@ def test_get_variant_snapshot(client, auth_headers):
 
 
 def test_get_variant_unknown_sku_404(client, auth_headers):
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.find_one = AsyncMock(return_value=None)
+    with patch("routes.internal.variants_table") as mock_variants:
+        mock_variants.get_item.return_value = {}
         response = client.get(
             "/api/internal/variants/GHOST", headers=auth_headers
         )

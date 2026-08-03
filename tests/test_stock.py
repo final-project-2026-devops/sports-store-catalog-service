@@ -1,18 +1,40 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from decimal import Decimal
+from unittest.mock import patch
 
+from botocore.exceptions import ClientError
 
-def variant_doc(stock):
-    return {"variants": [{"sku": "VR-BLK-42", "stock_quantity": stock}]}
+PRODUCT = {
+    "product_id": "p1",
+    "name": "Velocity Runner",
+    "image_url": "",
+    "is_active": True,
+}
+
+VARIANT_IN_STOCK = {
+    "sku": "VR-BLK-42",
+    "product_id": "p1",
+    "color": "Black",
+    "size": "42",
+    "price": Decimal("129.99"),
+    "stock_quantity": 15,
+}
 
 
 def test_stock_check_mixed_results(client, auth_headers):
-    async def find_one(query, *_args, **_kwargs):
-        if query["variants.sku"] == "VR-BLK-42":
-            return variant_doc(15)
-        return None
+    def get_variant_item(Key):
+        if Key.get("sku") == "VR-BLK-42":
+            return {"Item": VARIANT_IN_STOCK.copy()}
+        return {}
 
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.find_one = AsyncMock(side_effect=find_one)
+    def get_product_item(Key):
+        if Key.get("product_id") == "p1":
+            return {"Item": PRODUCT.copy()}
+        return {}
+
+    with patch("routes.internal.variants_table") as mock_variants, \
+         patch("routes.internal.products_table") as mock_products:
+        mock_variants.get_item.side_effect = get_variant_item
+        mock_products.get_item.side_effect = get_product_item
         response = client.post(
             "/api/internal/stock/check",
             json=[
@@ -30,8 +52,12 @@ def test_stock_check_mixed_results(client, auth_headers):
 
 
 def test_stock_check_insufficient_quantity(client, auth_headers):
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.find_one = AsyncMock(return_value=variant_doc(1))
+    with patch("routes.internal.variants_table") as mock_variants, \
+         patch("routes.internal.products_table") as mock_products:
+        mock_variants.get_item.return_value = {
+            "Item": {**VARIANT_IN_STOCK, "stock_quantity": 1}
+        }
+        mock_products.get_item.return_value = {"Item": PRODUCT.copy()}
         response = client.post(
             "/api/internal/stock/check",
             json=[{"sku": "VR-BLK-42", "quantity": 5}],
@@ -43,8 +69,8 @@ def test_stock_check_insufficient_quantity(client, auth_headers):
 
 
 def test_stock_decrement_success(client, auth_headers):
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+    with patch("routes.internal.variants_table") as mock_variants:
+        mock_variants.update_item.return_value = {}
         response = client.post(
             "/api/internal/stock/decrement",
             json=[{"sku": "VR-BLK-42", "quantity": 2}],
@@ -52,13 +78,17 @@ def test_stock_decrement_success(client, auth_headers):
         )
 
     assert response.status_code == 200
-    query = mock_col.update_one.call_args.args[0]
-    assert query["variants"]["$elemMatch"]["stock_quantity"] == {"$gte": 2}
+    update_kwargs = mock_variants.update_item.call_args.kwargs
+    assert update_kwargs["Key"] == {"sku": "VR-BLK-42"}
+    assert update_kwargs["ExpressionAttributeValues"] == {":neg": -2}
 
 
 def test_stock_decrement_insufficient_409(client, auth_headers):
-    with patch("routes.internal.products_collection") as mock_col:
-        mock_col.update_one = AsyncMock(return_value=MagicMock(modified_count=0))
+    error_response = {
+        "Error": {"Code": "ConditionalCheckFailedException", "Message": "boom"}
+    }
+    with patch("routes.internal.variants_table") as mock_variants:
+        mock_variants.update_item.side_effect = ClientError(error_response, "UpdateItem")
         response = client.post(
             "/api/internal/stock/decrement",
             json=[{"sku": "VR-BLK-42", "quantity": 99}],
